@@ -1,0 +1,190 @@
+'''
+@author:        Andrew West
+Clinic          Olson Pediatric Clinic
+File            PartnerOutRequestProcessor.py
+EMR System      Aprima EMR
+'''
+
+from org.nule.lighthl7lib.hl7 import Hl7Record, Hl7Field, Hl7Segment
+from java.lang import String
+
+
+def writeSegment(title, data):
+    global newMessage
+    newMessage.append(title)
+    newMessage.get(newMessage.size()).changeSegment(data)
+    return
+
+def renumberOBXandNTE(message):
+    i = 1
+    nteCounter = 1
+    obxCounter = 1
+    while i <= message.size():
+        segment = message.get(i)
+        if segment.getId() == 'OBR':
+            nteCounter = 1
+            obxCounter = 1
+        elif segment.getId() == 'OBX':
+            segment.field(1).changeField(str(obxCounter))
+            obxCounter += 1
+            nteCounter = 1
+        elif segment.getId() == 'NTE':
+            segment.field(1).changeField(str(nteCounter))
+            nteCounter += 1
+        i += 1
+    return message
+
+def process(inString):
+    '''
+    Processes message
+    '''
+    global newMessage
+    # This section converts the string to a HL7Record Object
+    msgString = inString.replace('\n', '\r')
+    inMessage = Hl7Record(msgString)
+    # Beyond this point you can have all the processing.
+    # This is a work around for the Healthdock having issues translating the physician from an MDM to ORU conversion
+    if inMessage.get('MSH').field(5).toString() == 'MDM':
+        docOBX = inMessage.get(inMessage.size())
+        if docOBX.getId() == 'OBX' and docOBX.field(3).toString() == 'DoctorCodes':
+            docList = docOBX.field(5).toString().split(':')
+            routing = {'24096':'1558505032^GRAFF^ELIZABETH',
+                       '26143':'1780796961^HARPER^MERI',
+                       '3060':'1922034826^HOFFMAN^JEFFREY',
+                       '1522':'1477596732^KITTAMS^BRIAN',
+                       '259':'1801831847^PALMER^DONALD',
+                       '2931':'1871529719^PANG^ALVAN'}
+            # Insert the routing physician in the OBR.16
+            for doc in docList:
+                if routing.has_key(doc):
+                    inMessage.get('OBR').field(16).changeField(routing[doc])
+                    break
+            inMessage.rebuild()
+            inMessage = Hl7Record(inMessage.toString().replace(docOBX.toString() + '\r', ''))
+    
+    zps = inMessage.get('ZPS')
+    i = 1
+    while i <= inMessage.size():
+        segment = inMessage.get(i)
+        if segment.getId() == 'MSH':
+            newMessage = Hl7Record(segment.toString())
+        elif segment.getId() == 'OBR':
+            orderPlacerNumber = ''
+            j = 1
+            while j <= segment.field(3).getRepCount():
+                obr3 = segment.field(3).getRep(j)
+                if obr3.getComp(2).toString() == 'Otr Ord Num':
+                    orderPlacerNumber = obr3.getRep(j).getComp(1).toString()
+                j += 1
+            if len(orderPlacerNumber) > 1:
+                segment.field(2).changeField(orderPlacerNumber)
+                segment.field(3).changeField(orderPlacerNumber)
+            else:
+                acc = segment.field(20).getRep(1).toString().split('^')
+                if len(acc) > 1:
+                    segment.field(3).changeField(acc[0])
+                else:
+                    segment.field(3).changeField(segment.field(2).toString())
+            segment.rebuild()
+            writeSegment(segment.getId(), segment.toString())
+        elif segment.getId() == 'OBX':
+            if segment.field(3).toString() == 'DoctorCodes':
+                i += 1
+                continue
+            segment.field(6).changeField(segment.field(6).getComp(1).toString())
+            segment.field(7).changeField(segment.field(7).getComp(1).toString())
+            segment.field(7).changeField(segment.field(7).getComp(2).toString())
+            if zps != None:
+                if inMessage.get('OBR').field(24).toString() != 'MCRO' and inMessage.get('OBR').field(24).toString() != 'AP':
+                    segment.field(15).changeField(zps.field(2).toString() + '^' + zps.field(3).toString() + '^' + zps.field(4).toString().replace('^^', '^'))
+            if segment.field(5).toString().find('~') >= 0 or segment.field(5).toString().find('\\.br\\') >= 0:
+                input = segment.field(5).toString()
+                segment.field(5).changeField('See Comments')
+                segment.rebuild()
+                writeSegment(segment.getId(), segment.toString())
+                allLines = input.split('\\.br\\')
+                if len(allLines) == 1:
+                    allLines = input.split('~')
+                for lineOfText in allLines:
+                    nteStr = 'NTE|||' + lineOfText
+                    writeSegment('NTE', nteStr)
+            else:
+                segment.rebuild()
+                writeSegment(segment.getId(), segment.toString())
+        elif segment.getId() == 'NTE':
+            input = segment.field(3).toString()
+            allLines = input.split('\\.br\\')
+            if len(allLines) == 1:
+                allLines = input.split('~')
+            if inMessage.get('OBR') != None and inMessage.get('OBR').field(4).getComp(1).toString() == 'PTH-I':
+                for line in allLines:
+                    if line.find('+') >= 0:
+                        prefix = line[:line.find('+')]
+                        postfix = line[line.find('+'):]
+                        nteStr = 'NTE|||' + prefix.rjust(8) + postfix
+                        writeSegment('NTE', nteStr)
+                    else:
+                        writeSegment('NTE', 'NTE|||' + line)
+            else:
+                for lineOfText in allLines:
+                    nteStr = 'NTE|||' + lineOfText
+                    writeSegment('NTE', nteStr)
+        elif segment.getId() == 'ZPS':
+            donNothing = 'nothing'
+        else:
+            writeSegment(segment.getId(), segment.toString())
+        i += 1
+    if inMessage.get('OBR') != None and inMessage.get('ZPS') != None:
+        if inMessage.get('OBR').field(24).toString() == 'LAB' or inMessage.get('OBR').field(24).toString() == 'BBK':
+            plstring = zps.field(3).toString() + '^' + zps.field(4).toString().replace('^^', '^')
+            writeSegment('NTE', 'NTE|||Performed at ' + plstring.replace('^', ', '))
+
+    #ZPS|1|' + facilityId + '|Legacy St Helen\'s Lab|500 N Columbia Rvr Hwy^^St Helen\'s^OR
+    if inMessage.get('ZPS') != None:
+        zps = inMessage.get('ZPS')
+        performingLabSt = 'NTE|1||Performed At: ' + zps.field(3).toString() + ' ' + zps.field(4).getComp(1).toString() + ' ' + zps.field(4).getComp(3).toString() + ', ' + zps.field(4).getComp(4).toString()
+        inMessage.append('NTE')
+        inMessage.get(inMessage.size()).changeSegment(performingLabSt)
+        noZps = inMessage.toString().replace(zps.toString() + '\r', '')
+        inMessage = Hl7Record(inMessage.toString().replace(zps.toString() + '\r', ''))
+    elif inMessage.get('OBR') != None and inMessage.get('OBR').field(24).toString() == 'RAD':  # Radiology performing location code translation
+        pv1_39 = inMessage.get('PV1').field(39).toString()
+        if pv1_39 == '35':
+            inMessage.append('NTE')
+            inMessage.get(inMessage.size()).changeSegment('NTE|1||Performed at: Legacy Mount Hood Medical Center')
+        elif pv1_39 == '15':
+            inMessage.append('NTE')
+            inMessage.get(inMessage.size()).changeSegment('NTE|1||Performed at: Legacy Emanuel Hospital and Health Center')
+        elif pv1_39 == '20':
+            inMessage.append('NTE')
+            inMessage.get(inMessage.size()).changeSegment('NTE|1||Performed at: Legacy Good Samaritan Hospital and Medical Center')
+        elif pv1_39 == '30':
+            inMessage.append('NTE')
+            inMessage.get(inMessage.size()).changeSegment('NTE|1||Performed at: Legacy Meridian Park Hospital')
+        elif pv1_39 == 'LS':
+            inMessage.append('NTE')
+            inMessage.get(inMessage.size()).changeSegment('NTE|1||Performed at: Legacy Salmon Creek Hospital')
+    else:  # Transcription Performing Location code translation
+        pv1_3_4 = inMessage.get('PV1').field(3).getComp(4).toString()
+        if pv1_3_4 == '100350':
+            inMessage.append('NTE')
+            inMessage.get(inMessage.size()).changeSegment('NTE|1||Performed at: Legacy Mount Hood Medical Center')
+        elif pv1_3_4 == '100150':
+            inMessage.append('NTE')
+            inMessage.get(inMessage.size()).changeSegment('NTE|1||Performed at: Legacy Emanuel Hospital and Health Center')
+        elif pv1_3_4 == '100200':
+            inMessage.append('NTE')
+            inMessage.get(inMessage.size()).changeSegment('NTE|1||Performed at: Legacy Good Samaritan Hospital and Medical Center')
+        elif pv1_3_4 == '100300':
+            inMessage.append('NTE')
+            inMessage.get(inMessage.size()).changeSegment('NTE|1||Performed at: Legacy Meridian Park Hospital')
+        elif pv1_3_4 == '100600':
+            inMessage.append('NTE')
+            inMessage.get(inMessage.size()).changeSegment('NTE|1||Performed at: Legacy Salmon Creek Hospital')        
+
+    newMessage = renumberOBXandNTE(newMessage)
+    # Beyond this point you CAN NOT have any processing.
+    # It is reserved for rebuilding the message
+    return newMessage.rebuild()
+    
+    
